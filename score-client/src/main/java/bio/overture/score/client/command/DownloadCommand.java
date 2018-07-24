@@ -1,35 +1,42 @@
 /*
- * Copyright (c) 2016 The Ontario Institute for Cancer Research. All rights reserved.                             
- *                                                                                                               
+ * Copyright (c) 2016 The Ontario Institute for Cancer Research. All rights reserved.
+ *
  * This program and the accompanying materials are made available under the terms of the GNU Public License v3.0.
- * You should have received a copy of the GNU General Public License along with                                  
- * this program. If not, see <http://www.gnu.org/licenses/>.                                                     
- *                                                                                                               
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY                           
- * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES                          
- * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT                           
- * SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,                                
- * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED                          
- * TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;                               
- * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER                              
- * IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN                         
+ * You should have received a copy of the GNU General Public License along with
+ * this program. If not, see <http://www.gnu.org/licenses/>.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND ANY
+ * EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
+ * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT
+ * SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+ * INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+ * TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS;
+ * OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER
+ * IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
  * ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 package bio.overture.score.client.command;
 
-import static java.util.stream.Collectors.toList;
-import static org.icgc.dcc.common.core.util.Formats.formatBytes;
-import static bio.overture.score.client.cli.Parameters.checkParameter;
-
+import bio.overture.score.client.cli.ConverterFactory.OutputLayoutConverter;
+import bio.overture.score.client.cli.CreatableDirectoryValidator;
+import bio.overture.score.client.cli.ObjectIdListValidator;
 import bio.overture.score.client.download.DownloadRequest;
 import bio.overture.score.client.download.DownloadService;
+import bio.overture.score.client.download.OutputLayout;
 import bio.overture.score.client.manifest.ManifestResource;
 import bio.overture.score.client.manifest.ManifestService;
 import bio.overture.score.client.metadata.Entity;
 import bio.overture.score.client.metadata.MetadataService;
+import com.beust.jcommander.Parameter;
+import com.beust.jcommander.Parameters;
+import com.google.common.collect.Multimaps;
+import com.google.common.hash.Hashing;
+import com.google.common.io.Files;
 import lombok.SneakyThrows;
-import lombok.val;
 import lombok.extern.slf4j.Slf4j;
+import lombok.val;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.stereotype.Component;
 
 import java.io.File;
 import java.io.IOException;
@@ -39,37 +46,17 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 
-import bio.overture.score.client.download.DownloadRequest;
-import bio.overture.score.client.download.DownloadService;
-import bio.overture.score.client.manifest.ManifestResource;
-import bio.overture.score.client.manifest.ManifestService;
-import bio.overture.score.client.metadata.Entity;
-import bio.overture.score.client.metadata.MetadataService;
-import bio.overture.score.client.cli.ConverterFactory.OutputLayoutConverter;
-import bio.overture.score.client.cli.CreatableDirectoryValidator;
-import bio.overture.score.client.cli.ObjectIdListValidator;
-import bio.overture.score.client.download.DownloadRequest;
-import bio.overture.score.client.download.DownloadService;
-import bio.overture.score.client.manifest.ManifestResource;
-import bio.overture.score.client.manifest.ManifestService;
-import bio.overture.score.client.metadata.Entity;
-import bio.overture.score.client.metadata.MetadataService;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
-
-import com.beust.jcommander.Parameter;
-import com.beust.jcommander.Parameters;
-import com.google.common.collect.Multimaps;
-import com.google.common.io.Files;
+import static bio.overture.score.client.cli.Parameters.checkParameter;
+import static com.google.common.io.Files.hash;
+import static java.lang.String.format;
+import static java.util.stream.Collectors.toList;
+import static org.icgc.dcc.common.core.util.Formats.formatBytes;
+import static org.icgc.dcc.common.core.util.stream.Collectors.toImmutableSet;
 
 @Slf4j
 @Component
 @Parameters(separators = "=", commandDescription = "Retrieve file object(s) from the remote storage repository")
 public class DownloadCommand extends RepositoryAccessCommand {
-
-  public enum OutputLayout {
-    BUNDLE, FILENAME, ID
-  }
 
   /**
    * Options
@@ -94,6 +81,8 @@ public class DownloadCommand extends RepositoryAccessCommand {
   private boolean validate = true;
   @Parameter(names = "--verify-connection", description = "Verify connection to repository", arity = 1)
   private boolean verifyConnection = true;
+  @Parameter(names = "--skip-existing-md5-check", description = "If the file exists, skip the md5 checksum comparison")
+  private boolean skipExistingMd5Check = false;
 
   /**
    * Dependencies
@@ -161,23 +150,106 @@ public class DownloadCommand extends RepositoryAccessCommand {
     }
 
     for (val entity : entitySet) {
-      terminal
-          .printLine()
-          .printf("[%s/%s] Downloading object: %s (%s)%n", i++, entities.size(), terminal.value(entity.getId()),
-              entity.getFileName())
-          .printLine();
+      val doDownload = force || !alreadyDownloaded(entity, skipExistingMd5Check);
+      if (doDownload){
+        terminal
+            .printLine()
+            .printf("[%s/%s] Downloading object: %s (%s)%n", i++, entitySet.size(), terminal.value(entity.getId()),
+                entity.getFileName())
+            .printLine();
 
-      val builder = DownloadRequest.builder();
-      val request = builder.outputDir(outputDir).entity(entity).objectId(entity.getId()).offset(offset).length(length)
-          .validate(validate).build();
+        val request = DownloadRequest.builder()
+            .outputDir(outputDir)
+            .entity(entity)
+            .objectId(entity.getId())
+            .offset(offset)
+            .length(length)
+            .validate(validate)
+            .build();
 
-      downloadService.download(request, force);
-      finalizeDownload(entity);
+        downloadService.download(request, force);
+        finalizeDownload(entity);
+      } else {
+        terminal
+            .printLine()
+            .printf("[%s/%s] Skipping Download for Object: %s (%s)%n", i++, entitySet.size(), terminal.value(entity.getId()),
+                entity.getFileName())
+            .printLine();
+      }
 
       terminal.println("Done.");
     }
 
     return SUCCESS_STATUS;
+  }
+
+  @SneakyThrows
+  private boolean isResumeable(Entity entity){
+    return downloadService.getDownloadStateProgress(outputDir, entity.getId()).isPresent();
+  }
+
+  @SneakyThrows
+  private boolean alreadyDownloaded(Entity entity, boolean skipExistingMd5Check)  {
+    val target = getLayoutTarget(entity);
+
+    // Check if final path exists
+    if (target.exists()){
+
+      // Continue with download if it was previously started
+      if (isResumeable(entity)){
+        return false;
+      }
+
+      // Since file exists, check its actual md5 against the expected
+      if (!skipExistingMd5Check){
+        val expectedMd5Result = downloadService.getExpectedMd5(entity.getId());
+
+        // Check there is an expected md5, if there isnt then assume the file has been downloaded already
+        if (expectedMd5Result.isPresent()){
+          val expectedMd5 = expectedMd5Result.get();
+          val actualMd5 = calculateMd5(target);
+
+          // Skip downloading since md5s match
+          if (expectedMd5.equals(actualMd5)){
+            val message = format("File already downloaded with matching checksum comparison, "
+                    + "skipping download: objectId=%s",
+                entity.getId());
+            log.warn(message);
+            terminal.printWarn(message);
+
+           // Do the download since the md5s dont match
+          } else {
+            val message = format("File exists but has a mismatching checksum. "
+                    + "Re-downloading : objectId=%s   expectedMd5=%s   actualMd5=%s",
+                entity.getId(), expectedMd5, actualMd5);
+            log.warn(message);
+            terminal.printWarn(message);
+            return false;
+          }
+
+          // Skip downloading since md5 doesnt exist
+        } else {
+          val message = format("File exists but does not have an expected MD5, skipping download: objectId=%s",
+              entity.getId());
+          log.warn(message);
+          terminal.printWarn(message);
+        }
+
+        // Skip the download since file exists and forcibly skipping md5 checking
+      } else {
+        val message = format("File already downloaded, skipping download and checksum comparison: objectId=%s",
+            entity.getId());
+        log.warn(message);
+        terminal.printWarn(message);
+      }
+      return true;
+    }
+    return false;
+  }
+
+  @SneakyThrows
+  private static String calculateMd5(File file){
+    return hash(file, Hashing.md5()).toString();
   }
 
   /**
@@ -299,8 +371,19 @@ public class DownloadCommand extends RepositoryAccessCommand {
     return fs.getUsableSpace();
   }
 
+  private boolean fileExists(Entity entity){
+    val target = getLayoutTarget(entity);
+    val source = getLayoutSource(entity);
+    return target.exists() || source.exists();
+  }
+
   private boolean verifyLocalAvailableSpace(Set<Entity> entities) {
-    val spaceRequired = downloadService.getSpaceRequired(entities);
+    // Filter out files that already exist
+    val nonExistingEntities = entities.stream()
+        .filter(x -> !fileExists(x))
+        .collect(toImmutableSet());
+
+    val spaceRequired = downloadService.getSpaceRequired(nonExistingEntities);
     val spaceAvailable = getLocalAvailableSpace();
     log.warn("Space required: {} ({})  Space available: {} ({})",
         formatBytes(spaceRequired), spaceRequired, formatBytes(spaceAvailable), spaceAvailable);
